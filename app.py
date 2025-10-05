@@ -43,19 +43,33 @@ if not IS_PIPELINE:
 # NLTK setup (download at runtime if missing; avoids baking corpora into slug)
 # =============================================================================
 def _ensure_nltk():
+    """
+    Ensures required NLTK resources are available at runtime.
+    Heroku slugs don't include nltk_data, so this downloads missing corpora.
+    """
+    # Stopwords
     try:
         _ = stopwords.words("english")
     except LookupError:
         nltk.download("stopwords", quiet=True)
+
+    # Tokenizers (both legacy and new split)
     try:
-        _ = nltk.word_tokenize("test")
+        nltk.data.find("tokenizers/punkt")
     except LookupError:
         nltk.download("punkt", quiet=True)
+    try:
+        nltk.data.find("tokenizers/punkt_tab")
+    except LookupError:
+        nltk.download("punkt_tab", quiet=True)
+
+    # WordNet + Lemmatization resources
     try:
         nltk.data.find("corpora/wordnet")
     except LookupError:
         nltk.download("wordnet", quiet=True)
         nltk.download("omw-1.4", quiet=True)
+
 
 _ensure_nltk()
 lemmatizer = WordNetLemmatizer()
