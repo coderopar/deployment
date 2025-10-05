@@ -1,8 +1,8 @@
 dash
 python-dotenv
-numpy==1.26.4
+numpy==1.26.4          # safe with TF 2.20 on Py3.11
 pandas
 nltk
-h5py==3.10.0
+h5py==3.11.0           # ⬅️ bump to >=3.11.0 (exact pin 3.11.0 is fine)
 tensorflow-cpu==2.20.0
 gunicorn
