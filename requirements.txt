@@ -1,8 +1,8 @@
 dash
 python-dotenv
-numpy
+numpy==1.26.4        # ✅ compatible with TF 2.15 on Py3.11
 pandas
 nltk
-h5py
-tensorflow-cpu==2.18.0
+h5py==3.10.0         # ✅ safe with TF 2.15
+tensorflow-cpu==2.15.1
 gunicorn
