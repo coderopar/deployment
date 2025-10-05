@@ -11,8 +11,10 @@ from dotenv import load_dotenv
 
 # --- TensorFlow / Keras ---
 import tensorflow as tf
-from tensorflow.keras.models import load_model
-from tensorflow.keras.utils import pad_sequences
+# NEW (required for TF 2.20 + Keras 3)
+from keras.models import load_model
+from keras.utils import pad_sequences
+
 
 # --- Dash UI ---
 import dash
