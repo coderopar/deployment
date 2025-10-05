@@ -1,89 +1,80 @@
 import os
 import re
 import math
-import json
-import pickle
+import joblib
 import nltk
-import numpy as np
-import pandas as pd
 from pathlib import Path
 from dotenv import load_dotenv
 
-# --- TensorFlow / Keras ---
-import tensorflow as tf
-# NEW (required for TF 2.20 + Keras 3)
-from keras.models import load_model
-from keras.utils import pad_sequences
-
-
-# --- Dash UI ---
+# Dash UI
 import dash
 from dash import dcc, html, Input, Output, State
 
-# --- NLTK assets ---
+# NLTK assets
 from nltk.corpus import stopwords
 from nltk.stem import WordNetLemmatizer
 
 load_dotenv()
 
-# ====================================================================================
+# =============================================================================
 # Environment & artifact paths
-# ====================================================================================
+# =============================================================================
 ENV = os.environ.get("environment", "development").lower()
-MODEL_PATH     = Path(os.environ.get("LSTM_MODEL_PATH", "/mnt/data/lstm_fake_news_model.h5"))
-TOKENIZER_PATH = Path(os.environ.get("TOKENIZER_PATH", "/mnt/data/tokenizer.pkl"))
 
-NUM_WORDS  = int(os.environ.get("NUM_WORDS", 50000))
-MAX_LEN    = int(os.environ.get("MAX_LEN",   256))
-OOV_TOKEN  = os.environ.get("OOV_TOKEN", "<UNK>")
-PADDING    = os.environ.get("PADDING", "post")
-TRUNCATING = os.environ.get("TRUNCATING", "post")
+# You said you’ll use the two joblib files you saved during training:
+MODEL_PATH = Path(os.environ.get("LOGREG_MODEL_PATH", "./models/logreg_tuned_model.joblib"))
+VEC_PATH   = Path(os.environ.get("TFIDF_PATH", "./models/tfidf_tuned_vectorizer.joblib"))
 
 LABEL_MAP = {0: "REAL", 1: "FAKE"}
 
 if not MODEL_PATH.exists():
     raise FileNotFoundError(f"Model not found at: {MODEL_PATH.resolve()}")
-if not TOKENIZER_PATH.exists():
-    raise FileNotFoundError(f"Tokenizer not found at: {TOKENIZER_PATH.resolve()}")
+MODEL = joblib.load(MODEL_PATH)
 
-# ====================================================================================
-# Load artifacts
-# ====================================================================================
-os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
-MODEL = load_model(MODEL_PATH)
-with open(TOKENIZER_PATH, "rb") as f:
-    TOKENIZER = pickle.load(f)
+# Detect if MODEL is a Pipeline with tfidf inside; if not, load vectorizer
+IS_PIPELINE = hasattr(MODEL, "predict_proba") and hasattr(MODEL, "get_params")
+VEC = None
+if not IS_PIPELINE:
+    if not VEC_PATH.exists():
+        raise FileNotFoundError(f"Vectorizer not found at: {VEC_PATH.resolve()}")
+    VEC = joblib.load(VEC_PATH)
 
-# ====================================================================================
-# NLTK setup
-# ====================================================================================
-try:
-    _ = stopwords.words("english")
-except LookupError:
-    nltk.download("stopwords", quiet=True)
-try:
-    _ = nltk.word_tokenize("test")
-except LookupError:
-    nltk.download("punkt", quiet=True)
-try:
-    nltk.data.find("corpora/wordnet")
-except LookupError:
-    nltk.download("wordnet", quiet=True)
-    nltk.download("omw-1.4", quiet=True)
+# =============================================================================
+# NLTK setup (download at runtime if missing; avoids baking corpora into slug)
+# =============================================================================
+def _ensure_nltk():
+    try:
+        _ = stopwords.words("english")
+    except LookupError:
+        nltk.download("stopwords", quiet=True)
+    try:
+        _ = nltk.word_tokenize("test")
+    except LookupError:
+        nltk.download("punkt", quiet=True)
+    try:
+        nltk.data.find("corpora/wordnet")
+    except LookupError:
+        nltk.download("wordnet", quiet=True)
+        nltk.download("omw-1.4", quiet=True)
 
+_ensure_nltk()
 lemmatizer = WordNetLemmatizer()
 stop_words = set(stopwords.words("english"))
 
-# ====================================================================================
-# Preprocessing (exactly like training)
-# ====================================================================================
+# =============================================================================
+# Preprocessing (mirrors your training)
+# =============================================================================
 URL_RE   = re.compile(r'https?://\S+|www\.\S+|\S+\.(com|org|net|edu|gov|io|co|uk)\S*|bit\.ly/\S+|t\.co/\S+')
 HTML_RE  = re.compile(r'<.*?>')
 NONALPH  = re.compile(r'[^a-z\s]+')
 WS_RE    = re.compile(r'\s+')
 
+def _is_nan(x):
+    # Avoid bringing in pandas just for isna
+    return x is None or (isinstance(x, float) and math.isnan(x))
+
 def preprocess_text_lowercase_url(text):
-    if text is None or (isinstance(text, float) and pd.isna(text)):
+    if _is_nan(text):
         return ""
     text = str(text)
     text = URL_RE.sub("", text)
@@ -106,17 +97,32 @@ def preprocess_and_lemmatize(text):
     return ""
 
 def apply_preprocessing(text: str) -> str:
+    """
+      1) lowercase + URL removal + whitespace clean
+      2) remove non-alphabetic, collapse spaces
+      3) tokenize, drop stopwords, lemmatize
+    """
     text = preprocess_text_lowercase_url(text)
+    # If HTML present in some sources, you can optionally:
+    # text = HTML_RE.sub(" ", text)
     text = _keep_alpha_only(text)
     text = preprocess_and_lemmatize(text)
     return text
 
-# ====================================================================================
-# Inference helper
-# ====================================================================================
-def _predict_lstm_on_combined(title: str, body: str):
+# =============================================================================
+# Inference helpers
+# =============================================================================
+def _sigmoid(x: float) -> float:
+    if x >= 0:
+        z = math.exp(-x)
+        return 1.0 / (1.0 + z)
+    else:
+        z = math.exp(x)
+        return z / (1.0 + z)
+
+def _predict_logreg_on_combined(title: str, body: str):
     title = (title or "").strip()
-    body  = (body or "").strip()
+    body  = (body  or "").strip()
     if not title and not body:
         return None, [None, None]
 
@@ -126,18 +132,51 @@ def _predict_lstm_on_combined(title: str, body: str):
     if not combined:
         return None, [None, None]
 
-    seq = TOKENIZER.texts_to_sequences([combined])
-    x   = pad_sequences(seq, maxlen=MAX_LEN, padding=PADDING, truncating=TRUNCATING)
-    pred = MODEL.predict(x, verbose=0)
-    if pred.ndim == 2 and pred.shape[1] == 1:
-        p_fake = float(pred[0, 0])
-        label  = int(p_fake >= 0.5)
-        return label, [1.0 - p_fake, p_fake]
-    return 1, [0.5, 0.5]
+    # Vectorize + predict
+    if IS_PIPELINE:
+        # MODEL already includes TF-IDF
+        proba_supported = hasattr(MODEL, "predict_proba")
+        if proba_supported:
+            proba = MODEL.predict_proba([combined])[0]
+        else:
+            # Fallback via decision_function -> pseudo-proba
+            margin = float(MODEL.decision_function([combined])[0])
+            p1 = _sigmoid(margin)  # probability for class 1
+            proba = [1.0 - p1, p1]
+    else:
+        X = VEC.transform([combined])
+        if hasattr(MODEL, "predict_proba"):
+            proba = MODEL.predict_proba(X)[0]
+        else:
+            margin = float(MODEL.decision_function(X)[0])
+            p1 = _sigmoid(margin)
+            proba = [1.0 - p1, p1]
 
-# ====================================================================================
-# Dash app with Tier-1 UI styling
-# ====================================================================================
+    # Make sure we order probs as [p_real (0), p_fake (1)] using classes_
+    if hasattr(MODEL, "classes_"):
+        # MODEL is estimator or pipeline with clf.classes_
+        classes = getattr(MODEL, "classes_", None)
+    else:
+        classes = None
+
+    # If classes_ is available and not [0,1], reorder
+    if classes is not None:
+        # Build a map from class label -> prob
+        prob_map = {int(classes[i]): float(proba[i]) for i in range(len(classes))}
+        p_real = prob_map.get(0, None)
+        p_fake = prob_map.get(1, None)
+        # If somehow missing, fall back to original order
+        if p_real is None or p_fake is None:
+            p_real, p_fake = float(proba[0]), float(proba[1])
+    else:
+        p_real, p_fake = float(proba[0]), float(proba[1])
+
+    label = 1 if p_fake >= 0.5 else 0
+    return label, [p_real, p_fake]
+
+# =============================================================================
+# Dash app (Tier-1 polished UI)
+# =============================================================================
 app = dash.Dash(__name__)
 server = app.server
 
@@ -155,7 +194,7 @@ app.layout = html.Div(
     },
     children=[
         html.H1(
-            "📰 Fake News Detector (LSTM)",
+            "📰 Fake News Detector (Logistic Regression)",
             style={"textAlign": "center", "margin": "0 0 14px 0", "fontSize": "28px", "color": "#333"},
         ),
         html.P(
@@ -212,9 +251,6 @@ app.layout = html.Div(
     ],
 )
 
-# ====================================================================================
-# Callback
-# ====================================================================================
 @app.callback(
     Output("output-container", "children"),
     Input("submit-button", "n_clicks"),
@@ -224,7 +260,7 @@ app.layout = html.Div(
 )
 def on_submit(n_clicks, title, body):
     try:
-        label, probs = _predict_lstm_on_combined(title, body)
+        label, probs = _predict_logreg_on_combined(title, body)
     except Exception as e:
         return f"Error: {e}"
 
@@ -233,19 +269,16 @@ def on_submit(n_clicks, title, body):
 
     sentiment = LABEL_MAP.get(label, str(label))
     if isinstance(probs, (list, tuple)) and len(probs) == 2 and all(p is not None for p in probs):
-        probs_fmt = [round(float(p), 4) for p in probs]
+        probs_fmt = [round(float(p), 4) for p in probs]  # [p_real, p_fake]
         return f"Prediction: {sentiment}  |  Probabilities (REAL, FAKE): {probs_fmt}"
     return f"Prediction: {sentiment}"
 
-# Warm-up
+# Optional warm-up
 try:
-    _ = _predict_lstm_on_combined("warmup title", "warmup body")
+    _ = _predict_logreg_on_combined("warmup title", "warmup body")
 except Exception:
     pass
 
-# ====================================================================================
-# Entrypoint
-# ====================================================================================
 if __name__ == "__main__":
     if ENV == "development":
         app.run(debug=True, port=int(os.environ.get("PORT", 8000)))
